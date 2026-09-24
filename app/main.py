@@ -8,10 +8,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import alignment
+from .captions import build_caption_segments
 from .errors import InvalidTimelineError
 from .schemas import (
     AlignRequest,
     AlignResponse,
+    CaptionSegment,
+    CaptionsRequest,
     HealthResponse,
     LocateQuoteRequest,
     QuoteHit,
@@ -62,7 +65,7 @@ async def validation_handler(_request: Request,
         if etype == "missing":
             messages.append(f"缺少必填字段：{loc}")
         elif etype in ("int_type", "int_parsing"):
-            if loc.endswith("max_edits"):
+            if loc.endswith(("max_edits", "max_chars")):
                 messages.append(f"字段 {loc} 必须是整数")
             else:
                 messages.append(f"字段 {loc} 必须是整数毫秒时间戳")
@@ -71,7 +74,14 @@ async def validation_handler(_request: Request,
         elif etype == "string_too_short":
             messages.append(f"字段 {loc} 必须是非空字符串")
         elif etype in ("greater_than_equal", "less_than_equal"):
-            range_hint = "，允许范围为 0～2" if loc.endswith("max_edits") else ""
+            if loc.endswith("max_edits"):
+                range_hint = "，允许范围为 0～2"
+            elif loc.endswith("max_chars"):
+                range_hint = "，允许范围为 1～80"
+            elif loc.endswith("max_duration_ms"):
+                range_hint = "，允许范围为 500～30000"
+            else:
+                range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
         elif etype == "extra_forbidden":
             messages.append(f"存在不允许的字段：{loc}")
@@ -93,6 +103,25 @@ async def align(req: AlignRequest) -> AlignResponse:
     validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
     result = build_timeline(req, alignment.backend_name())
     return AlignResponse(**result)
+
+
+@app.post(
+    "/captions",
+    response_model=list[CaptionSegment],
+    tags=["字幕切分"],
+)
+async def captions(req: CaptionsRequest) -> list[CaptionSegment]:
+    """按逐字时间轴把修订文本切分为字幕段。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    timeline = build_timeline(req, alignment.backend_name())
+    chars = timeline["chars"]
+    return build_caption_segments(
+        req.revised_text,
+        [c.start for c in chars],
+        [c.end for c in chars],
+        req.max_chars,
+        req.max_duration_ms,
+    )
 
 
 @app.post(

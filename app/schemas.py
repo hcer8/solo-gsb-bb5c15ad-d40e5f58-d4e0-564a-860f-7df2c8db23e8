@@ -37,6 +37,19 @@ class LocateQuoteRequest(AlignRequest):
     )
 
 
+class CaptionsRequest(AlignRequest):
+    """校时输入与字幕切分参数。"""
+
+    max_chars: StrictInt = Field(
+        ..., ge=1, le=80,
+        description="每段最大字符数（1～80）",
+    )
+    max_duration_ms: StrictInt = Field(
+        ..., ge=500, le=30000,
+        description="每段最大时长（毫秒，500～30000）",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -60,6 +73,14 @@ class AlignResponse(BaseModel):
     deleted_count: int = Field(..., description="被删除、未输出的识别字符数")
     matched_count: int = Field(..., description="匹配/替换到识别字符的修订字符数")
     backend: str = Field(..., description="对齐内核：native(C) 或 python")
+
+
+class CaptionSegment(BaseModel):
+    start_index: int = Field(..., description="段首字符在修订文本中的下标（从 0 开始）")
+    end_index: int = Field(..., description="段末字符下标（半开区间，不含该位置）")
+    text: str = Field(..., description="该段文字")
+    start: int = Field(..., description="段起始毫秒，取首字符时间轴的 start")
+    end: int = Field(..., description="段结束毫秒，取末字符时间轴的 end")
 
 
 class QuoteHit(BaseModel):

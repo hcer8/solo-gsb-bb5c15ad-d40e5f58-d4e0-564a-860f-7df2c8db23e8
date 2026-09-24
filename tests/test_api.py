@@ -436,3 +436,172 @@ def test_locate_quote_too_long_rejected(client, monkeypatch):
         "quote": "abc", "max_edits": 0})
     assert r.status_code == 422
     assert "引语长度" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 字幕切分
+# ---------------------------------------------------------------------------
+def _captions_payload(text, items, max_chars=3, max_duration_ms=30000,
+                      total_duration=None):
+    if total_duration is None:
+        total_duration = max((b for _, _, b in items), default=0)
+    return {
+        "recognized": rc(items),
+        "total_duration": total_duration,
+        "revised_text": text,
+        "max_chars": max_chars,
+        "max_duration_ms": max_duration_ms,
+    }
+
+
+def test_captions_basic_min_segment_count(client):
+    # 4 字、每段最多 2 字 → 恰好两段
+    payload = _captions_payload(
+        "你好世界",
+        [("你", 0, 100), ("好", 200, 300), ("世", 400, 500), ("界", 600, 700)],
+        max_chars=2, max_duration_ms=500)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"start_index": 0, "end_index": 2, "text": "你好", "start": 0, "end": 300},
+        {"start_index": 2, "end_index": 4, "text": "世界", "start": 400, "end": 700},
+    ]
+
+
+def test_captions_duration_limit_forces_split(client):
+    # 两字段跨度 900 超过 500 上限 → 只能逐字成段
+    payload = _captions_payload(
+        "甲乙", [("甲", 0, 400), ("乙", 500, 900)],
+        max_chars=80, max_duration_ms=500)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert [(s["start_index"], s["end_index"]) for s in r.json()] == [
+        (0, 1), (1, 2)]
+
+
+def test_captions_uses_computed_char_timeline(client):
+    # x、y 为新增字符，时间由空档均分推算，切分同样基于该时间轴
+    payload = _captions_payload(
+        "axyc", [("a", 0, 100), ("c", 600, 700)],
+        max_chars=2, max_duration_ms=500, total_duration=1000)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"start_index": 0, "end_index": 2, "text": "ax", "start": 0, "end": 350},
+        {"start_index": 2, "end_index": 4, "text": "yc", "start": 350, "end": 700},
+    ]
+
+
+def test_captions_punctuation_beats_pause(client):
+    # 两种断法段数相同：断在“。”后（+2000，停顿 0）胜过停顿 1000 的断点
+    payload = _captions_payload(
+        "甲。乙丙丁",
+        [("甲", 0, 100), ("。", 100, 200), ("乙", 200, 300),
+         ("丙", 1300, 1400), ("丁", 1400, 1500)],
+        max_chars=3, max_duration_ms=2000)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert [(s["start_index"], s["end_index"]) for s in r.json()] == [(0, 2), (2, 5)]
+    assert [s["text"] for s in r.json()] == ["甲。", "乙丙丁"]
+
+
+def test_captions_longer_pause_wins_without_punctuation(client):
+    # 无标点时停顿 1000 的断点（e=3）胜过停顿 0 的断点（e=2）
+    payload = _captions_payload(
+        "甲乙丙丁戊",
+        [("甲", 0, 100), ("乙", 100, 200), ("丙", 200, 300),
+         ("丁", 1300, 1400), ("戊", 1400, 1500)],
+        max_chars=3, max_duration_ms=2000)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert [(s["start_index"], s["end_index"]) for s in r.json()] == [(0, 3), (3, 5)]
+
+
+def test_captions_pause_clamped_to_1000_then_lexicographic(client):
+    # 停顿 5300 截到 1000 后与另一断点同分 → 取下标序列字典序最小（e=2）
+    payload = _captions_payload(
+        "甲乙丙丁戊",
+        [("甲", 0, 100), ("乙", 200, 300), ("丙", 5600, 5700),
+         ("丁", 6700, 6800), ("戊", 6900, 7000)],
+        max_chars=3, max_duration_ms=30000)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert [(s["start_index"], s["end_index"]) for s in r.json()] == [(0, 2), (2, 5)]
+
+
+def test_captions_equal_scores_choose_earliest_break(client):
+    # 全部停顿相同 → 同分，取字典序最小断点
+    payload = _captions_payload(
+        "甲乙丙丁戊",
+        [("甲", 0, 100), ("乙", 100, 200), ("丙", 200, 300),
+         ("丁", 300, 400), ("戊", 400, 500)],
+        max_chars=3, max_duration_ms=30000)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert [(s["start_index"], s["end_index"]) for s in r.json()] == [(0, 2), (2, 5)]
+
+
+def test_captions_max_chars_one_splits_every_char(client):
+    payload = _captions_payload(
+        "甲乙丙", [("甲", 0, 100), ("乙", 200, 300), ("丙", 400, 500)],
+        max_chars=1, max_duration_ms=500)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200, r.text
+    assert [(s["start_index"], s["end_index"]) for s in r.json()] == [
+        (0, 1), (1, 2), (2, 3)]
+
+
+def test_captions_empty_text_returns_empty_array(client):
+    payload = _captions_payload("", [], max_chars=10, max_duration_ms=5000,
+                                total_duration=0)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_captions_single_char_span_exceeds_limit_422(client):
+    payload = _captions_payload(
+        "啊", [("啊", 0, 40000)],
+        max_chars=10, max_duration_ms=30000, total_duration=50000)
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 422
+    assert "单字跨度" in r.json()["detail"]
+    assert "30000" in r.json()["detail"]
+
+
+def test_captions_max_chars_range(client):
+    base = _captions_payload("甲乙", [("甲", 0, 100), ("乙", 200, 300)])
+    for bad in (0, 81):
+        r = client.post("/captions", json={**base, "max_chars": bad})
+        assert r.status_code == 422
+        assert "1～80" in r.json()["detail"]
+
+
+def test_captions_max_duration_range(client):
+    base = _captions_payload("甲乙", [("甲", 0, 100), ("乙", 200, 300)])
+    for bad in (499, 30001):
+        r = client.post("/captions", json={**base, "max_duration_ms": bad})
+        assert r.status_code == 422
+        assert "500～30000" in r.json()["detail"]
+
+
+def test_captions_reuses_alignment_validation(client):
+    payload = _captions_payload("a", [("a", 300, 100)])
+    r = client.post("/captions", json=payload)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_captions_extra_field_rejected(client):
+    payload = _captions_payload("a", [("a", 0, 100)])
+    r = client.post("/captions", json={**payload, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
+
+
+def test_captions_missing_param_rejected(client):
+    r = client.post("/captions", json={
+        "recognized": [], "total_duration": 0, "revised_text": "a",
+        "max_chars": 10})
+    assert r.status_code == 422
+    assert "max_duration_ms" in r.json()["detail"]
